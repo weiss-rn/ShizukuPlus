@@ -2551,6 +2551,25 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     }
 
     static boolean sendBinderToUserApp(Binder binder, String packageName, int userId) {
+        // One safe re-attempt for transient failures (provider not published yet when the
+        // foreground event fires, brief freeze, ...). Deliberately no force-stop here: killing
+        // the client is unsafe on the live observer path (PackageInstaller NPE, #386/#394) -
+        // that stays reserved for sendBinderToUserAppWithRetry, used only from the delayed
+        // catch-up pass. Upstream retries every client; 827e1d27 left this path with no
+        // recovery at all (#371).
+        if (sendBinderToUserAppInternal(binder, packageName, userId)) {
+            return true;
+        }
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return sendBinderToUserAppInternal(binder, packageName, userId);
+    }
+
+    private static boolean sendBinderToUserAppInternal(Binder binder, String packageName, int userId) {
         try {
             DeviceIdleControllerApis.addPowerSaveTempWhitelistApp(packageName, 30 * 1000, userId,
                     316/* PowerExemptionManager#REASON_SHELL */, "shell");
@@ -2574,7 +2593,10 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
         IBinder token = null;
 
         try {
-            provider = ActivityManagerApis.getContentProviderExternal(name, userId, token, "com.android.shell");
+            // Stock parity: upstream passes the authority as the tag. The tag feeds AMS
+            // attribution/visibility paths for the external acquisition; a hardcoded
+            // "com.android.shell" is an unexplained divergence (#371).
+            provider = ActivityManagerApis.getContentProviderExternal(name, userId, token, name);
             if (provider == null) {
                 LOGGER.e("provider is null %s %d", name, userId);
                 return false;
@@ -2614,12 +2636,10 @@ public class ShizukuService extends Service<ShizukuUserServiceManager, ShizukuCl
     }
 
     // sendBinderToManager() (above) has always force-stopped + retried once on failure - "for
-    // unknown reason, sometimes this could happen" per its own long-standing comment. Every
-    // ordinary client (Hail, App Ops, WifiList, Tasker, ...) is delivered through the exact same
-    // sendBinderToUserApp() via BinderSender.sendBinder()/ShizukuService.sendBinderToClient(),
-    // and used to get this same treatment - upstream RikkaApps/Shizuku still has it - until
-    // 827e1d27 ("improve startup speed") relocated the kill-and-retry exclusively into the
-    // manager-only overloads and left this call site with no recovery at all (#371). A
+    // unknown reason, sometimes this could happen" per its own long-standing comment. The plain
+    // sendBinderToUserApp() above now does one force-stop-free re-attempt itself; this overload
+    // keeps the heavier kill-and-retry exclusively for the delayed catch-up pass, where the
+    // PackageInstaller hazard behind #386 no longer applies. A
     // provider.asBinder().pingBinder() failure ("provider is dead") is exactly what a frozen
     // target's ContentProvider binder looks like from the caller's side (a synchronous ping to a
     // Cached-Apps-Frozen process gets BR_FROZEN_REPLY, not a normal reply) - force-stopping lets
